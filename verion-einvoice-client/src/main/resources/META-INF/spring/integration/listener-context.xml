@@ -1,0 +1,144 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<beans xmlns="http://www.springframework.org/schema/beans"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xmlns:int="http://www.springframework.org/schema/integration"
+	xmlns:int-file="http://www.springframework.org/schema/integration/file"
+	xmlns:int-http="http://www.springframework.org/schema/integration/http"
+	xmlns:task="http://www.springframework.org/schema/task"
+	xmlns:int-jpa="http://www.springframework.org/schema/integration/jpa"
+	xsi:schemaLocation="http://www.springframework.org/schema/integration/http http://www.springframework.org/schema/integration/http/spring-integration-http.xsd
+		http://www.springframework.org/schema/integration http://www.springframework.org/schema/integration/spring-integration.xsd
+		http://www.springframework.org/schema/integration/file http://www.springframework.org/schema/integration/file/spring-integration-file.xsd
+		http://www.springframework.org/schema/task http://www.springframework.org/schema/task/spring-task.xsd
+		http://www.springframework.org/schema/beans http://www.springframework.org/schema/beans/spring-beans.xsd
+		http://www.springframework.org/schema/integration/jpa http://www.springframework.org/schema/integration/jpa/spring-integration-jpa.xsd">
+
+
+	<int-file:inbound-channel-adapter directory="/tmp/data"
+		channel="inbound" filename-pattern="*.pdf" >
+		<int:poller fixed-delay="500" max-messages-per-poll="1" task-executor="taskExecutor"/>
+	</int-file:inbound-channel-adapter>
+
+	<int:channel id="inbound"/>
+	
+	
+	<int:chain input-channel="inbound" output-channel="outbound">
+		<!-- sign based on the bytes -->
+		<int:header-enricher>
+			<int:header name="signature" expression="@signatureService.generateSignature(payload)"/>
+		</int:header-enricher>
+	</int:chain>
+	
+	<int:channel id="outbound"/>
+	
+	<!-- now we've got a file, get a matching invoice -->
+	<!-- need to put the "file" somewhere to trigger -->
+	
+	<int:claim-check-in input-channel="outbound" output-channel="generator"/>
+
+	<int:channel id="generator"/>
+
+	<int:chain input-channel="generator" output-channel="requestor">
+		<int:header-enricher>
+			<int:header name="fileMessageId" expression="payload"/>
+		</int:header-enricher>
+		<int:transformer expression="@configurationService.getConfiguration()"/>
+		<!-- copy details into header -->
+		<int:header-enricher>
+			<int:header name="userId" expression="payload['userId']"/>
+			<int:header name="url" expression="payload['url']"/>
+			<int:header name="password" expression="payload['password']"/>
+		</int:header-enricher>
+		<!-- convert the configuration to an invoice object -->
+		<int:transformer expression="new io.pivotal.poc.einvoice.domain.Invoice(headers['signature'])"/>
+	</int:chain>
+	
+	<int:publish-subscribe-channel id="requestor">
+		<int:interceptors>
+			<int:ref bean="messageStoreInterceptor"/>
+		</int:interceptors>	
+	</int:publish-subscribe-channel>
+	
+	<int:object-to-json-transformer input-channel="requestor" output-channel="sender"/>	
+		
+	<int:channel id="sender"/>	
+		
+	<int-http:outbound-gateway 
+		url-expression="headers['url']"
+		http-method="PUT"
+		request-channel="sender"
+		reply-channel="response" 
+		request-factory="restSupport"
+		expected-response-type="java.lang.String"/>
+	
+	
+	<int:channel id="response">
+		<int:interceptors>
+			<int:ref bean="messageStoreInterceptor"/>
+		</int:interceptors>	
+	</int:channel>
+	
+	<!-- now get the response (an invoice object in json) and use it to store the file -->
+	<int:chain input-channel="response" output-channel="persist">
+		<int:json-to-object-transformer type="io.pivotal.poc.einvoice.domain.Invoice"/>
+		<!-- get the id -->
+		<int:header-enricher should-skip-nulls="false">
+			<int:header name="invoiceId" expression="payload.getId()"/>
+		</int:header-enricher>
+		<!-- send the second request and persist the file -->
+		<int:transformer expression="headers['fileMessageId']"/>
+		<!-- retrieve -->
+		<int:claim-check-out remove-message="true"/>
+		<!-- not put the file in a map -->
+		<int:transformer expression="@multiPartSupport.getMap(payload,headers['invoiceId'])"/>
+		<!-- clean up the headers -->
+		<int:header-enricher should-skip-nulls="false">
+			<int:header name="Content-Type" value="multipart/form-data"/>
+			<int:header name="content-type" value="null"/>
+		</int:header-enricher>
+	</int:chain>
+	
+	
+	<int:channel id="persist">
+		<int:interceptors>
+			<int:ref bean="multiPartSupport"/>
+		</int:interceptors>
+	</int:channel>
+	
+	<int-http:outbound-channel-adapter 
+		channel="persist"
+		url-expression="headers['url'] +'/' + headers['invoiceId']"
+		http-method="POST"
+		extract-payload="true"
+		request-factory="restSupport"/>
+	
+	<int-jpa:outbound-channel-adapter 
+		channel="requestor"
+		entity-manager-factory="entityManagerFactory"
+		persist-mode="PERSIST">
+		<int-jpa:transactional/>	
+	</int-jpa:outbound-channel-adapter>
+	
+	
+	<bean id="messageStore"
+		class="org.springframework.integration.store.SimpleMessageStore"/>
+
+	<bean id="messageStoreInterceptor"
+		class="io.pivotal.poc.einvoice.support.MessageSupportInterceptor"/>
+		
+	<bean id="signatureService"
+		class="io.pivotal.poc.einvoice.service.SimpleSignatureService"/>
+		
+	<bean id="configurationService"
+		class="io.pivotal.poc.einvoice.service.SimpleConfigurationService"/>
+
+	<bean id="multiPartSupport"
+		class="io.pivotal.poc.einvoice.support.MultiPartSupport"/>
+
+	<task:executor id="taskExecutor"/>
+
+	
+	<bean id="restSupport"
+		class="io.pivotal.poc.einvoice.support.RestSupport">
+	</bean>
+</beans>
